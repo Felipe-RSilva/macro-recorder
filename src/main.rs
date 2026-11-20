@@ -82,9 +82,11 @@ enum HotkeyTarget {
     Record,
     Play,
     Pause,
+    Stop,
 }
 
-const HOTKEY_TARGETS: [HotkeyTarget; 3] = [HotkeyTarget::Record, HotkeyTarget::Play, HotkeyTarget::Pause];
+const HOTKEY_TARGETS: [HotkeyTarget; 4] =
+    [HotkeyTarget::Record, HotkeyTarget::Play, HotkeyTarget::Pause, HotkeyTarget::Stop];
 
 #[derive(Debug)]
 enum InputMessage {
@@ -116,6 +118,7 @@ struct RecorderApp {
     record_hotkey: String,
     play_hotkey: String,
     pause_hotkey: String,
+    stop_hotkey: String,
     capturing_hotkey: Option<HotkeyTarget>,
     /// Keys whose press triggered a shortcut; their repeats and release are swallowed.
     swallowed: HashSet<String>,
@@ -154,6 +157,7 @@ impl RecorderApp {
             record_hotkey: config.record_hotkey,
             play_hotkey: config.play_hotkey,
             pause_hotkey: config.pause_hotkey,
+            stop_hotkey: config.stop_hotkey,
             capturing_hotkey: None,
             swallowed: HashSet::new(),
             held_mods: HashSet::new(),
@@ -431,6 +435,7 @@ impl RecorderApp {
             HotkeyTarget::Record => &self.record_hotkey,
             HotkeyTarget::Play => &self.play_hotkey,
             HotkeyTarget::Pause => &self.pause_hotkey,
+            HotkeyTarget::Stop => &self.stop_hotkey,
         }
     }
 
@@ -470,6 +475,13 @@ impl RecorderApp {
                 }
             }
             HotkeyTarget::Pause => self.toggle_pause(),
+            HotkeyTarget::Stop => {
+                if self.recording {
+                    self.stop_recording();
+                } else if self.playback_active {
+                    self.stop_playback();
+                }
+            }
         }
     }
 
@@ -493,6 +505,7 @@ impl RecorderApp {
                 HotkeyTarget::Record => (&mut self.record_hotkey, "gravação"),
                 HotkeyTarget::Play => (&mut self.play_hotkey, "reprodução"),
                 HotkeyTarget::Pause => (&mut self.pause_hotkey, "pausa"),
+                HotkeyTarget::Stop => (&mut self.stop_hotkey, "parada"),
             };
             *slot = encoded;
             self.status = format!("Atalho de {name}: {}", hotkey.label());
@@ -528,6 +541,7 @@ impl RecorderApp {
             record_hotkey: self.record_hotkey.clone(),
             play_hotkey: self.play_hotkey.clone(),
             pause_hotkey: self.pause_hotkey.clone(),
+            stop_hotkey: self.stop_hotkey.clone(),
             speed: self.speed,
             custom_speed: self.custom_speed,
             repeats: self.repeats,
@@ -814,11 +828,6 @@ impl eframe::App for RecorderApp {
                         ui.label(RichText::new(label).size(11.0).strong().color(color));
                     });
                 });
-                ui.label(
-                    RichText::new("Grava cliques, teclas e onde o mouse parou. Nada além disso.")
-                        .size(12.5)
-                        .color(MUTED),
-                );
                 ui.add_space(14.0);
 
                 egui::Frame::none()
@@ -858,7 +867,9 @@ impl eframe::App for RecorderApp {
                             ui.add_space(4.0);
                             self.hotkey_row(ui, HotkeyTarget::Play, "Reproduzir");
                             ui.add_space(4.0);
-                            self.hotkey_row(ui, HotkeyTarget::Pause, "Pausar reprodução");
+                            self.hotkey_row(ui, HotkeyTarget::Pause, "Pausar");
+                            ui.add_space(4.0);
+                            self.hotkey_row(ui, HotkeyTarget::Stop, "Parar");
                             ui.add_space(4.0);
                             ui.label(RichText::new("Aceita combinações como Ctrl+K. Esc cancela.").size(10.5).color(MUTED));
                         });

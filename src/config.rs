@@ -12,6 +12,8 @@ pub struct Config {
     pub play_hotkey: String,
     /// Shortcut that pauses/resumes playback.
     pub pause_hotkey: String,
+    /// Shortcut that stops recording or playback.
+    pub stop_hotkey: String,
     /// 0 = 1x, 1 = 0.5x, 2 = 2x, 100 = 100x, `u32::MAX` = custom.
     pub speed: u32,
     pub custom_speed: u32,
@@ -25,6 +27,7 @@ impl Default for Config {
             record_hotkey: "F9".to_owned(),
             play_hotkey: "F11".to_owned(),
             pause_hotkey: "F10".to_owned(),
+            stop_hotkey: "F12".to_owned(),
             speed: 0,
             custom_speed: 8,
             repeats: 1,
