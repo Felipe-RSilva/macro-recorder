@@ -9,6 +9,7 @@ mod keys;
 use config::Config;
 use keys::key_from_name;
 use std::path::PathBuf;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -70,6 +71,14 @@ enum InputAction {
     RightDown,
     RightUp,
     Move(i32, i32),
+    /// A key press that cannot be recorded; only used to explain why a shortcut was refused.
+    UnsupportedKey(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HotkeyTarget {
+    Record,
+    Pause,
 }
 
 #[derive(Debug)]
@@ -100,8 +109,11 @@ struct RecorderApp {
     status: String,
     error: Option<String>,
     record_hotkey: String,
-    capturing_hotkey: bool,
-    hotkey_held: bool,
+    pause_hotkey: String,
+    capturing_hotkey: Option<HotkeyTarget>,
+    held_keys: HashSet<String>,
+    playback_paused: Arc<AtomicBool>,
+    macro_name: String,
     speed: u32,
     custom_speed: u32,
     repeats: u32,
@@ -131,8 +143,11 @@ impl RecorderApp {
             status: "Pronto para gravar".to_owned(),
             error: None,
             record_hotkey: config.record_hotkey,
-            capturing_hotkey: false,
-            hotkey_held: false,
+            pause_hotkey: config.pause_hotkey,
+            capturing_hotkey: None,
+            held_keys: HashSet::new(),
+            playback_paused: Arc::new(AtomicBool::new(false)),
+            macro_name: "minha-macro".to_owned(),
             speed: config.speed,
             custom_speed: config.custom_speed,
             repeats: config.repeats,
@@ -174,8 +189,22 @@ impl RecorderApp {
         if let Some(stop) = &self.playback_stop {
             stop.store(false, Ordering::SeqCst);
         }
+        self.playback_paused.store(false, Ordering::SeqCst);
         self.playback_active = false;
         self.status = "Reprodução parada".to_owned();
+    }
+
+    fn toggle_pause(&mut self) {
+        if !self.playback_active {
+            return;
+        }
+        let now_paused = !self.playback_paused.load(Ordering::SeqCst);
+        self.playback_paused.store(now_paused, Ordering::SeqCst);
+        self.status = if now_paused {
+            "Reprodução pausada".to_owned()
+        } else {
+            "Reprodução retomada".to_owned()
+        };
     }
 
     fn start_playback(&mut self) {
@@ -186,6 +215,8 @@ impl RecorderApp {
         self.stop_recording();
         let stop = Arc::new(AtomicBool::new(true));
         self.playback_stop = Some(stop.clone());
+        self.playback_paused.store(false, Ordering::SeqCst);
+        let paused = self.playback_paused.clone();
         self.playback_active = true;
         self.error = None;
         self.status = if self.continuous {
@@ -204,7 +235,7 @@ impl RecorderApp {
         let continuous = self.continuous;
         let tx = self.ui_tx.clone();
         thread::spawn(move || {
-            let result = replay_events(&events, repeats, speed, continuous, &stop);
+            let result = replay_events(&events, repeats, speed, continuous, &stop, &paused);
             let message = match result {
                 Ok(()) => UiMessage::PlaybackFinished,
                 Err(problem) => UiMessage::PlaybackError(problem),
@@ -214,11 +245,13 @@ impl RecorderApp {
     }
 
     fn save_macro(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .add_filter("Macro recording", &["json"])
-            .set_file_name("my-macro.json")
-            .save_file()
-        else {
+            .set_file_name(format!("{}.json", sanitize_file_name(&self.macro_name)));
+        if let Some(folder) = self.current_file.as_ref().and_then(|file| file.parent()) {
+            dialog = dialog.set_directory(folder);
+        }
+        let Some(path) = dialog.save_file() else {
             return;
         };
         let file = MacroFile {
@@ -228,7 +261,7 @@ impl RecorderApp {
         match serde_json::to_vec_pretty(&file) {
             Ok(bytes) => match std::fs::write(&path, bytes) {
                 Ok(()) => {
-                    self.current_file = Some(path.clone());
+                    self.set_current_file(path);
                     self.error = None;
                     self.status = format!("{} ações salvas", self.events.len());
                 }
@@ -236,6 +269,13 @@ impl RecorderApp {
             },
             Err(problem) => self.error = Some(format!("Could not prepare recording: {problem}")),
         }
+    }
+
+    fn set_current_file(&mut self, path: PathBuf) {
+        if let Some(stem) = path.file_stem() {
+            self.macro_name = stem.to_string_lossy().into_owned();
+        }
+        self.current_file = Some(path);
     }
 
     fn open_macro(&mut self) {
@@ -251,7 +291,7 @@ impl RecorderApp {
                     self.stop_recording();
                     self.stop_playback();
                     self.events = file.events;
-                    self.current_file = Some(path);
+                    self.set_current_file(path);
                     self.error = None;
                     self.status = format!("{} ações abertas", self.events.len());
                 }
@@ -272,26 +312,38 @@ impl RecorderApp {
                     self.error = Some(format!("Keyboard and pointer listening stopped: {problem}"));
                 }
                 InputMessage::Event(action) => {
+                    if let InputAction::UnsupportedKey(name) = &action {
+                        if self.capturing_hotkey.is_some() {
+                            self.error = Some(format!("A tecla {name} não é suportada. Escolha outra."));
+                        }
+                        continue;
+                    }
                     if let InputAction::KeyDown(key) | InputAction::KeyUp(key) = &action {
                         let pressed = matches!(action, InputAction::KeyDown(_));
-                        if self.capturing_hotkey {
+                        if let Some(target) = self.capturing_hotkey {
                             if pressed {
-                                self.finish_hotkey_capture(key.clone());
+                                self.finish_hotkey_capture(target, key.clone());
                             }
                             continue;
                         }
-                        if *key == self.record_hotkey {
-                            if pressed && !self.hotkey_held {
-                                self.hotkey_held = true;
-                                if self.recording {
-                                    self.stop_recording();
+                        if !pressed {
+                            self.held_keys.remove(key);
+                        }
+                        let is_record = *key == self.record_hotkey;
+                        let is_pause = *key == self.pause_hotkey && self.playback_active;
+                        if is_record || is_pause {
+                            if pressed && self.held_keys.insert(key.clone()) {
+                                if is_record {
+                                    if self.recording {
+                                        self.stop_recording();
+                                    } else {
+                                        self.start_recording();
+                                    }
                                 } else {
-                                    self.start_recording();
+                                    self.toggle_pause();
                                 }
-                            } else if !pressed {
-                                self.hotkey_held = false;
                             }
-                            continue; // the shortcut itself is never part of a macro
+                            continue; // shortcuts are never part of a macro
                         }
                     }
                     let is_stop_key = matches!(
@@ -326,7 +378,7 @@ impl RecorderApp {
                             InputAction::LeftUp => Action::LeftUp,
                             InputAction::RightDown => Action::RightDown,
                             InputAction::RightUp => Action::RightUp,
-                            InputAction::Move(_, _) => unreachable!(),
+                            InputAction::Move(_, _) | InputAction::UnsupportedKey(_) => unreachable!(),
                         };
                         self.push_event(action, self.raw_position);
                     }
@@ -347,29 +399,86 @@ impl RecorderApp {
         }
     }
 
-    fn finish_hotkey_capture(&mut self, key: String) {
-        self.capturing_hotkey = false;
+    fn finish_hotkey_capture(&mut self, target: HotkeyTarget, key: String) {
+        self.capturing_hotkey = None;
+        // The same physical press may also reach us through the global listener; ignore it.
+        self.held_keys.insert(key.clone());
+        let other = match target {
+            HotkeyTarget::Record => &self.pause_hotkey,
+            HotkeyTarget::Pause => &self.record_hotkey,
+        };
         if key == "Pause" || key == "ScrollLock" {
             self.error = Some("Pause e Scroll Lock são reservadas para parar. Escolha outra tecla.".to_owned());
         } else if key == "Escape" {
             self.status = "Troca de atalho cancelada".to_owned();
+        } else if key == *other {
+            self.error = Some("Essa tecla já é usada pelo outro atalho. Escolha outra.".to_owned());
         } else {
-            self.status = format!("Atalho de gravação: {}", key_label(&key));
-            self.record_hotkey = key;
+            let name = match target {
+                HotkeyTarget::Record => {
+                    self.record_hotkey = key.clone();
+                    "gravação"
+                }
+                HotkeyTarget::Pause => {
+                    self.pause_hotkey = key.clone();
+                    "pausa"
+                }
+            };
+            self.status = format!("Atalho de {name}: {}", key_label(&key));
             self.error = None;
             self.save_config();
+        }
+    }
+
+    /// While waiting for a new shortcut, also listen to the app's own window events.
+    /// This works even if the global keyboard listener misses the key.
+    fn capture_hotkey_from_window(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.capturing_hotkey else {
+            return;
+        };
+        let pressed = ctx.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Key { key, pressed: true, repeat: false, .. } => egui_key_name(*key),
+                _ => None,
+            })
+        });
+        if let Some(name) = pressed {
+            self.finish_hotkey_capture(target, name);
         }
     }
 
     fn save_config(&self) {
         Config {
             record_hotkey: self.record_hotkey.clone(),
+            pause_hotkey: self.pause_hotkey.clone(),
             speed: self.speed,
             custom_speed: self.custom_speed,
             repeats: self.repeats,
             continuous: self.continuous,
         }
         .save();
+    }
+
+    fn hotkey_row(&mut self, ui: &mut egui::Ui, target: HotkeyTarget, title: &str) {
+        let waiting = self.capturing_hotkey == Some(target);
+        let current = match target {
+            HotkeyTarget::Record => self.record_hotkey.clone(),
+            HotkeyTarget::Pause => self.pause_hotkey.clone(),
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).size(12.0).color(TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let text = if waiting { "Cancelar" } else { "Alterar" };
+                let response = ui.button(text);
+                if response.clicked() {
+                    self.capturing_hotkey = if waiting { None } else { Some(target) };
+                    self.error = None;
+                }
+                response.surrender_focus(); // otherwise Space/Enter would re-trigger the button
+                let shown = if waiting { "aperte uma tecla...".to_owned() } else { key_label(&current) };
+                ui.label(RichText::new(shown).size(13.0).strong().color(ACCENT));
+            });
+        });
     }
 
     fn is_inside_window(&self, x: i32, y: i32) -> bool {
@@ -403,7 +512,7 @@ impl RecorderApp {
                         .fill(record_fill)
                         .stroke(Stroke::new(1.0_f32, RED))
                         .rounding(10.0)
-                        .min_size(Vec2::new(170.0, 46.0)),
+                        .min_size(Vec2::new(150.0, 46.0)),
                 )
                 .clicked()
             {
@@ -422,11 +531,31 @@ impl RecorderApp {
                         .fill(Color32::from_rgb(27, 88, 70))
                         .stroke(Stroke::new(1.0_f32, GREEN))
                         .rounding(10.0)
-                        .min_size(Vec2::new(150.0, 46.0)),
+                        .min_size(Vec2::new(135.0, 46.0)),
                 )
                 .clicked()
             {
                 self.start_playback();
+            }
+
+            let paused = self.playback_paused.load(Ordering::SeqCst);
+            if ui
+                .add_enabled(
+                    self.playback_active,
+                    egui::Button::new(
+                        RichText::new(if paused { "▶  Continuar" } else { "Pausar" })
+                            .size(15.0)
+                            .strong()
+                            .color(TEXT),
+                    )
+                    .fill(PANEL_LIGHT)
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(72, 86, 108)))
+                    .rounding(10.0)
+                    .min_size(Vec2::new(110.0, 46.0)),
+                )
+                .clicked()
+            {
+                self.toggle_pause();
             }
 
             if ui
@@ -436,7 +565,7 @@ impl RecorderApp {
                         .fill(PANEL_LIGHT)
                         .stroke(Stroke::new(1.0_f32, Color32::from_rgb(72, 86, 108)))
                         .rounding(10.0)
-                        .min_size(Vec2::new(100.0, 46.0)),
+                        .min_size(Vec2::new(90.0, 46.0)),
                 )
                 .clicked()
             {
@@ -495,7 +624,7 @@ impl RecorderApp {
         });
     }
 
-    fn show_event_list(&self, ui: &mut egui::Ui, height: f32) {
+    fn show_event_list(&mut self, ui: &mut egui::Ui, width: f32, height: f32) {
         egui::Frame::none()
             .fill(PANEL)
             .stroke(Stroke::new(1.0_f32, Color32::from_rgb(39, 49, 66)))
@@ -503,8 +632,19 @@ impl RecorderApp {
             .inner_margin(12.0)
             .show(ui, |ui| {
                 ui.set_height(height);
-                ui.set_width(ui.available_width());
-                ui.label(RichText::new("AÇÕES GRAVADAS").size(10.5).strong().color(MUTED));
+                ui.set_width(width - 26.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("AÇÕES GRAVADAS").size(10.5).strong().color(MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(".json").size(11.0).color(MUTED));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.macro_name)
+                                .desired_width(150.0)
+                                .hint_text("nome do arquivo"),
+                        );
+                        ui.label(RichText::new("Nome").size(11.0).color(MUTED));
+                    });
+                });
                 ui.add_space(6.0);
                 if self.events.is_empty() {
                     ui.add_space(24.0);
@@ -581,6 +721,7 @@ impl eframe::App for RecorderApp {
             egui::Rect::from_min_max(rect.min * scale, rect.max * scale)
         });
         self.handle_input();
+        self.capture_hotkey_from_window(ctx);
         ctx.request_repaint_after(Duration::from_millis(RECORDING_SAMPLE_INTERVAL_MS));
 
         egui::CentralPanel::default()
@@ -620,9 +761,11 @@ impl eframe::App for RecorderApp {
                 ui.horizontal_top(|ui| {
                     let side_width = 220.0;
                     let list_width = (ui.available_width() - side_width - 12.0).max(200.0);
-                    ui.allocate_ui(Vec2::new(list_width, list_height + 26.0), |ui| {
-                        self.show_event_list(ui, list_height);
-                    });
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(list_width, list_height + 26.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| self.show_event_list(ui, list_width, list_height),
+                    );
                     ui.vertical(|ui| {
                         ui.set_width(side_width);
                         let before = (self.speed, self.custom_speed, self.repeats, self.continuous);
@@ -636,23 +779,12 @@ impl eframe::App for RecorderApp {
                             ui.add_space(10.0);
                         };
 
-                        card(ui, "ATALHO DE GRAVAÇÃO", &mut |ui| {
-                            ui.horizontal(|ui| {
-                                let shown = if self.capturing_hotkey {
-                                    "Pressione uma tecla...".to_owned()
-                                } else {
-                                    key_label(&self.record_hotkey)
-                                };
-                                ui.label(RichText::new(shown).size(15.0).strong().color(ACCENT));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let text = if self.capturing_hotkey { "Cancelar" } else { "Alterar" };
-                                    if ui.button(text).clicked() {
-                                        self.capturing_hotkey = !self.capturing_hotkey;
-                                        self.error = None;
-                                    }
-                                });
-                            });
-                            ui.label(RichText::new("Inicia e para a gravação. Esc cancela a troca.").size(10.5).color(MUTED));
+                        card(ui, "ATALHOS", &mut |ui| {
+                            self.hotkey_row(ui, HotkeyTarget::Record, "Gravar / parar");
+                            ui.add_space(4.0);
+                            self.hotkey_row(ui, HotkeyTarget::Pause, "Pausar reprodução");
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("Esc cancela a troca.").size(10.5).color(MUTED));
                         });
 
                         card(ui, "VELOCIDADE DE REPRODUÇÃO", &mut |ui| {
@@ -716,6 +848,36 @@ impl eframe::App for RecorderApp {
     }
 }
 
+fn sanitize_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| if "\\/:*?\"<>|".contains(c) || c.is_control() { '-' } else { c })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c| c == '.' || c == ' ').to_owned();
+    if cleaned.is_empty() {
+        "minha-macro".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+fn egui_key_name(key: egui::Key) -> Option<String> {
+    use egui::Key;
+    let name = match key {
+        Key::ArrowUp => "UpArrow".to_owned(),
+        Key::ArrowDown => "DownArrow".to_owned(),
+        Key::ArrowLeft => "LeftArrow".to_owned(),
+        Key::ArrowRight => "RightArrow".to_owned(),
+        Key::Enter => "Return".to_owned(),
+        Key::A | Key::B | Key::C | Key::D | Key::E | Key::F | Key::G | Key::H | Key::I | Key::J
+        | Key::K | Key::L | Key::M | Key::N | Key::O | Key::P | Key::Q | Key::R | Key::S | Key::T
+        | Key::U | Key::V | Key::W | Key::X | Key::Y | Key::Z => format!("Key{key:?}"),
+        other => format!("{other:?}"),
+    };
+    key_from_name(&name).is_some().then_some(name)
+}
+
 fn key_label(key: &str) -> String {
     if let Some(letter) = key.strip_prefix("Key").filter(|rest| rest.len() == 1) {
         return letter.to_owned();
@@ -775,7 +937,7 @@ fn classify_key_event(key: rdev::Key, pressed: bool) -> Option<InputAction> {
     let name = format!("{key:?}");
     let supported = key_from_name(&name).is_some() || name == "Pause" || name == "ScrollLock";
     if !supported {
-        return None;
+        return pressed.then_some(InputAction::UnsupportedKey(name));
     }
     Some(if pressed {
         InputAction::KeyDown(name)
@@ -816,12 +978,34 @@ fn double_click_pause() -> Duration {
     Duration::ZERO
 }
 
+/// Sleeps for `total`, but stays frozen while playback is paused and wakes up early on stop.
+fn pausable_sleep(total: Duration, stop: &AtomicBool, paused: &AtomicBool) {
+    let slice = Duration::from_millis(10);
+    let mut remaining = total;
+    loop {
+        if !stop.load(Ordering::SeqCst) {
+            return;
+        }
+        if paused.load(Ordering::SeqCst) {
+            thread::sleep(slice);
+            continue;
+        }
+        if remaining.is_zero() {
+            return;
+        }
+        let step = remaining.min(slice);
+        thread::sleep(step);
+        remaining -= step;
+    }
+}
+
 fn replay_events(
     events: &[RecordedEvent],
     repeats: u32,
     speed: u32,
     continuous: bool,
     stop: &AtomicBool,
+    paused: &AtomicBool,
 ) -> Result<(), String> {
     let mut enigo = Enigo::new(&Settings::default()).map_err(|problem| format!("Could not start playback: {problem}"))?;
     let mut pass = 0_u64;
@@ -832,6 +1016,7 @@ fn replay_events(
             if !stop.load(Ordering::SeqCst) {
                 break;
             }
+            pausable_sleep(Duration::ZERO, stop, paused);
 
             let event = &events[index];
             apply_action(&mut enigo, event)?;
@@ -850,7 +1035,7 @@ fn replay_events(
                     playback_delay_ms(gap, speed)
                 };
                 if delay_ms > 0 {
-                    thread::sleep(Duration::from_millis(delay_ms));
+                    pausable_sleep(Duration::from_millis(delay_ms), stop, paused);
                 }
             }
         }
@@ -859,7 +1044,7 @@ fn replay_events(
             break;
         }
         if had_left_button_action {
-            thread::sleep(double_click_pause());
+            pausable_sleep(double_click_pause(), stop, paused);
         }
         pass += 1;
     }

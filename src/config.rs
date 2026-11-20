@@ -8,6 +8,8 @@ use std::path::PathBuf;
 pub struct Config {
     /// `rdev` key name that starts/stops recording.
     pub record_hotkey: String,
+    /// `rdev` key name that pauses/resumes playback.
+    pub pause_hotkey: String,
     /// 0 = 1x, 1 = 0.5x, 2 = 2x, 100 = 100x, `u32::MAX` = custom.
     pub speed: u32,
     pub custom_speed: u32,
@@ -19,6 +21,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             record_hotkey: "F9".to_owned(),
+            pause_hotkey: "F10".to_owned(),
             speed: 0,
             custom_speed: 8,
             repeats: 1,
