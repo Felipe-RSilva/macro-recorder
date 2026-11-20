@@ -4,9 +4,11 @@ use eframe::egui::{self, Color32, RichText, Stroke, Vec2};
 use enigo::{Button as EnigoButton, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 use serde::{Deserialize, Serialize};
 mod config;
+mod hotkey;
 mod keys;
 
 use config::Config;
+use hotkey::{modifier_kind, Hotkey, ModKind, Mods};
 use keys::key_from_name;
 use std::path::PathBuf;
 use std::collections::HashSet;
@@ -78,8 +80,11 @@ enum InputAction {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HotkeyTarget {
     Record,
+    Play,
     Pause,
 }
+
+const HOTKEY_TARGETS: [HotkeyTarget; 3] = [HotkeyTarget::Record, HotkeyTarget::Play, HotkeyTarget::Pause];
 
 #[derive(Debug)]
 enum InputMessage {
@@ -109,9 +114,13 @@ struct RecorderApp {
     status: String,
     error: Option<String>,
     record_hotkey: String,
+    play_hotkey: String,
     pause_hotkey: String,
     capturing_hotkey: Option<HotkeyTarget>,
-    held_keys: HashSet<String>,
+    /// Keys whose press triggered a shortcut; their repeats and release are swallowed.
+    swallowed: HashSet<String>,
+    /// Modifier keys (rdev names) currently held down.
+    held_mods: HashSet<String>,
     playback_paused: Arc<AtomicBool>,
     macro_name: String,
     speed: u32,
@@ -143,9 +152,11 @@ impl RecorderApp {
             status: "Pronto para gravar".to_owned(),
             error: None,
             record_hotkey: config.record_hotkey,
+            play_hotkey: config.play_hotkey,
             pause_hotkey: config.pause_hotkey,
             capturing_hotkey: None,
-            held_keys: HashSet::new(),
+            swallowed: HashSet::new(),
+            held_mods: HashSet::new(),
             playback_paused: Arc::new(AtomicBool::new(false)),
             macro_name: "minha-macro".to_owned(),
             speed: config.speed,
@@ -320,31 +331,33 @@ impl RecorderApp {
                     }
                     if let InputAction::KeyDown(key) | InputAction::KeyUp(key) = &action {
                         let pressed = matches!(action, InputAction::KeyDown(_));
-                        if let Some(target) = self.capturing_hotkey {
+                        let modifier = modifier_kind(key).is_some();
+                        if modifier {
                             if pressed {
-                                self.finish_hotkey_capture(target, key.clone());
+                                self.held_mods.insert(key.clone());
+                            } else {
+                                self.held_mods.remove(key);
                             }
-                            continue;
                         }
-                        if !pressed {
-                            self.held_keys.remove(key);
+                        if !pressed && self.swallowed.remove(key) {
+                            continue; // release of a key that triggered a shortcut
                         }
-                        let is_record = *key == self.record_hotkey;
-                        let is_pause = *key == self.pause_hotkey && self.playback_active;
-                        if is_record || is_pause {
-                            // The record shortcut does nothing while a macro is playing.
-                            if pressed && self.held_keys.insert(key.clone()) && !(is_record && self.playback_active) {
-                                if is_record {
-                                    if self.recording {
-                                        self.stop_recording();
-                                    } else {
-                                        self.start_recording();
-                                    }
-                                } else {
-                                    self.toggle_pause();
-                                }
+                        if pressed && !modifier {
+                            if self.swallowed.contains(key) {
+                                continue; // auto-repeat of a shortcut key
                             }
-                            continue; // shortcuts are never part of a macro
+                            let mods = self.current_mods();
+                            if let Some(target) = self.capturing_hotkey {
+                                self.finish_hotkey_capture(target, Hotkey::new(mods, key));
+                                continue;
+                            }
+                            if let Some(target) = self.shortcut_for(key, mods) {
+                                self.swallowed.insert(key.clone());
+                                self.run_shortcut(target);
+                                continue; // shortcuts are never part of a macro
+                            }
+                        } else if modifier && self.capturing_hotkey.is_some() {
+                            continue; // wait for the main key of the combination
                         }
                     }
                     let is_stop_key = matches!(
@@ -400,32 +413,89 @@ impl RecorderApp {
         }
     }
 
-    fn finish_hotkey_capture(&mut self, target: HotkeyTarget, key: String) {
+    fn current_mods(&self) -> Mods {
+        let mut mods = Mods::default();
+        for name in &self.held_mods {
+            match modifier_kind(name) {
+                Some(ModKind::Ctrl) => mods.ctrl = true,
+                Some(ModKind::Shift) => mods.shift = true,
+                Some(ModKind::Alt) => mods.alt = true,
+                None => {}
+            }
+        }
+        mods
+    }
+
+    fn hotkey_text(&self, target: HotkeyTarget) -> &String {
+        match target {
+            HotkeyTarget::Record => &self.record_hotkey,
+            HotkeyTarget::Play => &self.play_hotkey,
+            HotkeyTarget::Pause => &self.pause_hotkey,
+        }
+    }
+
+    fn shortcut_for(&self, key: &str, mods: Mods) -> Option<HotkeyTarget> {
+        HOTKEY_TARGETS
+            .into_iter()
+            .find(|target| Hotkey::parse(self.hotkey_text(*target)).matches(key, mods))
+    }
+
+    fn run_shortcut(&mut self, target: HotkeyTarget) {
+        match target {
+            HotkeyTarget::Record => {
+                if self.playback_active {
+                    return; // recording is not allowed while a macro is playing
+                }
+                if self.recording {
+                    // Drop the modifier presses that were part of the shortcut itself.
+                    if Hotkey::parse(&self.record_hotkey).mods != Mods::default() {
+                        while matches!(
+                            self.events.last().map(|e| &e.action),
+                            Some(Action::KeyDown { key }) if modifier_kind(key).is_some()
+                        ) {
+                            self.events.pop();
+                        }
+                    }
+                    self.stop_recording();
+                } else {
+                    self.start_recording();
+                    // Releasing the shortcut's modifiers must not end up in the macro.
+                    let held: Vec<String> = self.held_mods.iter().cloned().collect();
+                    self.swallowed.extend(held);
+                }
+            }
+            HotkeyTarget::Play => {
+                if !self.recording && !self.playback_active {
+                    self.start_playback();
+                }
+            }
+            HotkeyTarget::Pause => self.toggle_pause(),
+        }
+    }
+
+    fn finish_hotkey_capture(&mut self, target: HotkeyTarget, hotkey: Hotkey) {
         self.capturing_hotkey = None;
         // The same physical press may also reach us through the global listener; ignore it.
-        self.held_keys.insert(key.clone());
-        let other = match target {
-            HotkeyTarget::Record => &self.pause_hotkey,
-            HotkeyTarget::Pause => &self.record_hotkey,
-        };
-        if key == "Pause" || key == "ScrollLock" {
+        self.swallowed.insert(hotkey.key.clone());
+        let encoded = hotkey.encode();
+        let reserved = hotkey.mods == Mods::default() && (hotkey.key == "Pause" || hotkey.key == "ScrollLock");
+        let taken = HOTKEY_TARGETS
+            .into_iter()
+            .any(|other| other != target && *self.hotkey_text(other) == encoded);
+        if reserved {
             self.error = Some("Pause e Scroll Lock são reservadas para parar. Escolha outra tecla.".to_owned());
-        } else if key == "Escape" {
+        } else if hotkey.key == "Escape" && hotkey.mods == Mods::default() {
             self.status = "Troca de atalho cancelada".to_owned();
-        } else if key == *other {
-            self.error = Some("Essa tecla já é usada pelo outro atalho. Escolha outra.".to_owned());
+        } else if taken {
+            self.error = Some("Esse atalho já está em uso. Escolha outro.".to_owned());
         } else {
-            let name = match target {
-                HotkeyTarget::Record => {
-                    self.record_hotkey = key.clone();
-                    "gravação"
-                }
-                HotkeyTarget::Pause => {
-                    self.pause_hotkey = key.clone();
-                    "pausa"
-                }
+            let (slot, name) = match target {
+                HotkeyTarget::Record => (&mut self.record_hotkey, "gravação"),
+                HotkeyTarget::Play => (&mut self.play_hotkey, "reprodução"),
+                HotkeyTarget::Pause => (&mut self.pause_hotkey, "pausa"),
             };
-            self.status = format!("Atalho de {name}: {}", key_label(&key));
+            *slot = encoded;
+            self.status = format!("Atalho de {name}: {}", hotkey.label());
             self.error = None;
             self.save_config();
         }
@@ -439,18 +509,24 @@ impl RecorderApp {
         };
         let pressed = ctx.input(|input| {
             input.events.iter().find_map(|event| match event {
-                egui::Event::Key { key, pressed: true, repeat: false, .. } => egui_key_name(*key),
+                egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => {
+                    egui_key_name(*key).map(|name| {
+                        let mods = Mods { ctrl: modifiers.ctrl, shift: modifiers.shift, alt: modifiers.alt };
+                        Hotkey::new(mods, &name)
+                    })
+                }
                 _ => None,
             })
         });
-        if let Some(name) = pressed {
-            self.finish_hotkey_capture(target, name);
+        if let Some(hotkey) = pressed {
+            self.finish_hotkey_capture(target, hotkey);
         }
     }
 
     fn save_config(&self) {
         Config {
             record_hotkey: self.record_hotkey.clone(),
+            play_hotkey: self.play_hotkey.clone(),
             pause_hotkey: self.pause_hotkey.clone(),
             speed: self.speed,
             custom_speed: self.custom_speed,
@@ -462,10 +538,7 @@ impl RecorderApp {
 
     fn hotkey_row(&mut self, ui: &mut egui::Ui, target: HotkeyTarget, title: &str) {
         let waiting = self.capturing_hotkey == Some(target);
-        let current = match target {
-            HotkeyTarget::Record => self.record_hotkey.clone(),
-            HotkeyTarget::Pause => self.pause_hotkey.clone(),
-        };
+        let current = Hotkey::parse(self.hotkey_text(target)).label();
         ui.horizontal(|ui| {
             ui.label(RichText::new(title).size(12.0).color(TEXT));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -476,7 +549,7 @@ impl RecorderApp {
                     self.error = None;
                 }
                 response.surrender_focus(); // otherwise Space/Enter would re-trigger the button
-                let shown = if waiting { "aperte uma tecla...".to_owned() } else { key_label(&current) };
+                let shown = if waiting { "aperte as teclas...".to_owned() } else { current };
                 ui.label(RichText::new(shown).size(13.0).strong().color(ACCENT));
             });
         });
@@ -783,9 +856,11 @@ impl eframe::App for RecorderApp {
                         card(ui, "ATALHOS", &mut |ui| {
                             self.hotkey_row(ui, HotkeyTarget::Record, "Gravar / parar");
                             ui.add_space(4.0);
+                            self.hotkey_row(ui, HotkeyTarget::Play, "Reproduzir");
+                            ui.add_space(4.0);
                             self.hotkey_row(ui, HotkeyTarget::Pause, "Pausar reprodução");
                             ui.add_space(4.0);
-                            ui.label(RichText::new("Esc cancela a troca.").size(10.5).color(MUTED));
+                            ui.label(RichText::new("Aceita combinações como Ctrl+K. Esc cancela.").size(10.5).color(MUTED));
                         });
 
                         card(ui, "VELOCIDADE DE REPRODUÇÃO", &mut |ui| {
@@ -877,16 +952,6 @@ fn egui_key_name(key: egui::Key) -> Option<String> {
         other => format!("{other:?}"),
     };
     key_from_name(&name).is_some().then_some(name)
-}
-
-fn key_label(key: &str) -> String {
-    if let Some(letter) = key.strip_prefix("Key").filter(|rest| rest.len() == 1) {
-        return letter.to_owned();
-    }
-    if let Some(digit) = key.strip_prefix("Num").filter(|rest| rest.len() == 1) {
-        return digit.to_owned();
-    }
-    key.to_owned()
 }
 
 fn describe_event(event: &RecordedEvent) -> (String, Color32) {
