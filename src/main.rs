@@ -332,7 +332,8 @@ impl RecorderApp {
                         let is_record = *key == self.record_hotkey;
                         let is_pause = *key == self.pause_hotkey && self.playback_active;
                         if is_record || is_pause {
-                            if pressed && self.held_keys.insert(key.clone()) {
+                            // The record shortcut does nothing while a macro is playing.
+                            if pressed && self.held_keys.insert(key.clone()) && !(is_record && self.playback_active) {
                                 if is_record {
                                     if self.recording {
                                         self.stop_recording();
@@ -946,12 +947,21 @@ fn classify_key_event(key: rdev::Key, pressed: bool) -> Option<InputAction> {
     })
 }
 
+static UI_CONTEXT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
 fn listen_for_input(tx: Sender<InputMessage>) {
     thread::spawn(move || {
         let event_tx = tx.clone();
         let result = rdev::listen(move |event| {
             if let Some(action) = classify_input_event(event.event_type) {
+                let wake_ui = !matches!(action, InputAction::Move(_, _));
                 let _ = event_tx.send(InputMessage::Event(action));
+                // Wake the UI so shortcuts work even while the window is in the background.
+                if wake_ui {
+                    if let Some(ctx) = UI_CONTEXT.get() {
+                        ctx.request_repaint();
+                    }
+                }
             }
         });
         if let Err(problem) = result {
@@ -1123,7 +1133,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Macro Recorder",
         options,
-        Box::new(move |_creation_context| Ok(Box::new(RecorderApp::new(input_rx, screenshot_path)))),
+        Box::new(move |creation_context| {
+            let _ = UI_CONTEXT.set(creation_context.egui_ctx.clone());
+            Ok(Box::new(RecorderApp::new(input_rx, screenshot_path)))
+        }),
     )
 }
 
