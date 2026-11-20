@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "values": [
+    {"name":"default playback speed setting","group":"speed","value":0,"unit":"setting index (normal 1x)","source":"function 0x401000; function 0x401489"},
+    {"name":"custom playback multiplier default","group":"speed","value":8,"unit":"x","source":"function 0x401000"},
+    {"name":"available playback presets","group":"speed","value":"1x (setting 0), 2x (setting 2), 100x (setting 100), custom 1-100","source":"function 0x401489"},
+    {"name":"custom speed minimum","group":"speed","value":1,"unit":"x","source":"function 0x401489"},
+    {"name":"custom speed maximum","group":"speed","value":100,"unit":"x","source":"function 0x401489"},
+    {"name":"playback delay at setting 0","group":"speed","value":"next event timestamp minus current event timestamp","unit":"ms","source":"function 0x4034c6"},
+    {"name":"playback delay at setting 1","group":"speed","value":"2 * (next event timestamp minus current event timestamp)","unit":"ms","source":"function 0x4034c6"},
+    {"name":"playback delay above setting 1 and below 100","group":"speed","value":"(next event timestamp minus current event timestamp) / speed, integer division","unit":"ms","source":"function 0x4034c6"},
+    {"name":"fast playback threshold","group":"speed","value":100,"unit":"x","source":"function 0x4034c6"},
+    {"name":"fast playback timer without emitted mouse move","group":"speed","value":1,"unit":"ms","source":"function 0x4034c6"},
+    {"name":"fast playback timer after emitted mouse move","group":"speed","value":75,"unit":"ms","source":"function 0x4034c6"},
+    {"name":"mouse move coalescing interval","group":"speed","value":6,"unit":"events; also emits the last move in each run","source":"function 0x4034c6"},
+    {"name":"post-click playback pause","group":"playback","value":"half of the current Windows double-click interval","source":"function 0x4034c6"},
+    {"name":"record polling interval","group":"recording","value":10,"unit":"ms","source":"function 0x4032fd"},
+    {"name":"recorded actions","group":"recording","value":"key transitions, pointer movement, left/right mouse transitions; first changed key per poll except virtual key 0xA0; pointer skips zero coordinates and repeated low-byte x+y","source":"function 0x4032fd"},
+    {"name":"record event size","group":"recording","value":20,"unit":"bytes","source":"function 0x4032fd"},
+    {"name":"original loader allocation padding","group":"file format","value":4096,"unit":"memory bytes; not an established file header","source":"function 0x402f8e"},
+    {"name":"original file validation","group":"file format","value":"at least 2 bytes; first byte zero; read length divisible by 20","source":"function 0x402f8e"},
+    {"name":"original file writer","group":"file format","value":"writes the caller-supplied buffer range; full recording serialization is not established","source":"function 0x403ea0"},
+    {"name":"default repeat count","group":"playback","value":1,"unit":"loop","source":"function 0x401489; data 0x40600c"},
+    {"name":"continuous playback default","group":"playback","value":false,"source":"function 0x401489; zero-initialized data 0x406d1a"},
+    {"name":"rebuilt recording format","group":"file format","value":"versioned JSON; intentionally not original .rec compatible","source":"rebuilt app"}
+  ]
+}
