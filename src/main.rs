@@ -8,7 +8,7 @@ mod hotkey;
 mod keys;
 
 use config::Config;
-use hotkey::{modifier_kind, Hotkey, ModKind, Mods};
+use hotkey::{hotkey_key_allowed, modifier_kind, Hotkey, ModKind, Mods};
 use keys::key_from_name;
 use std::path::PathBuf;
 use std::collections::HashSet;
@@ -74,7 +74,7 @@ enum InputAction {
     RightUp,
     Move(i32, i32),
     /// A key press that cannot be recorded; only used to explain why a shortcut was refused.
-    UnsupportedKey(String),
+    UnsupportedKey(String, bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -327,41 +327,19 @@ impl RecorderApp {
                     self.error = Some(format!("Keyboard and pointer listening stopped: {problem}"));
                 }
                 InputMessage::Event(action) => {
-                    if let InputAction::UnsupportedKey(name) = &action {
-                        if self.capturing_hotkey.is_some() {
+                    if let InputAction::UnsupportedKey(name, pressed) = &action {
+                        // Keypad, media keys and the like cannot be recorded, but can be shortcuts.
+                        if hotkey_key_allowed(name) {
+                            self.shortcut_key_event(name, *pressed);
+                        } else if *pressed && self.capturing_hotkey.is_some() {
                             self.error = Some(format!("A tecla {name} não é suportada. Escolha outra."));
                         }
                         continue;
                     }
                     if let InputAction::KeyDown(key) | InputAction::KeyUp(key) = &action {
                         let pressed = matches!(action, InputAction::KeyDown(_));
-                        let modifier = modifier_kind(key).is_some();
-                        if modifier {
-                            if pressed {
-                                self.held_mods.insert(key.clone());
-                            } else {
-                                self.held_mods.remove(key);
-                            }
-                        }
-                        if !pressed && self.swallowed.remove(key) {
-                            continue; // release of a key that triggered a shortcut
-                        }
-                        if pressed && !modifier {
-                            if self.swallowed.contains(key) {
-                                continue; // auto-repeat of a shortcut key
-                            }
-                            let mods = self.current_mods();
-                            if let Some(target) = self.capturing_hotkey {
-                                self.finish_hotkey_capture(target, Hotkey::new(mods, key));
-                                continue;
-                            }
-                            if let Some(target) = self.shortcut_for(key, mods) {
-                                self.swallowed.insert(key.clone());
-                                self.run_shortcut(target);
-                                continue; // shortcuts are never part of a macro
-                            }
-                        } else if modifier && self.capturing_hotkey.is_some() {
-                            continue; // wait for the main key of the combination
+                        if self.shortcut_key_event(key, pressed) {
+                            continue;
                         }
                     }
                     let is_stop_key = matches!(
@@ -396,7 +374,7 @@ impl RecorderApp {
                             InputAction::LeftUp => Action::LeftUp,
                             InputAction::RightDown => Action::RightDown,
                             InputAction::RightUp => Action::RightUp,
-                            InputAction::Move(_, _) | InputAction::UnsupportedKey(_) => unreachable!(),
+                            InputAction::Move(_, _) | InputAction::UnsupportedKey(_, _) => unreachable!(),
                         };
                         self.push_event(action, self.raw_position);
                     }
@@ -417,6 +395,39 @@ impl RecorderApp {
         }
     }
 
+    /// Tracks modifiers and runs/captures shortcuts. Returns true if the key was consumed.
+    fn shortcut_key_event(&mut self, key: &str, pressed: bool) -> bool {
+        let modifier = modifier_kind(key).is_some();
+        if modifier {
+            if pressed {
+                self.held_mods.insert(key.to_owned());
+            } else {
+                self.held_mods.remove(key);
+            }
+        }
+        if !pressed && self.swallowed.remove(key) {
+            return true; // release of a key that triggered a shortcut
+        }
+        if pressed && !modifier {
+            if self.swallowed.contains(key) {
+                return true; // auto-repeat of a shortcut key
+            }
+            let mods = self.current_mods();
+            if let Some(target) = self.capturing_hotkey {
+                self.finish_hotkey_capture(target, Hotkey::new(mods, key));
+                return true;
+            }
+            if let Some(target) = self.shortcut_for(key, mods) {
+                self.swallowed.insert(key.to_owned());
+                self.run_shortcut(target);
+                return true; // shortcuts are never part of a macro
+            }
+        } else if modifier && self.capturing_hotkey.is_some() {
+            return true; // wait for the main key of the combination
+        }
+        false
+    }
+
     fn current_mods(&self) -> Mods {
         let mut mods = Mods::default();
         for name in &self.held_mods {
@@ -424,6 +435,7 @@ impl RecorderApp {
                 Some(ModKind::Ctrl) => mods.ctrl = true,
                 Some(ModKind::Shift) => mods.shift = true,
                 Some(ModKind::Alt) => mods.alt = true,
+                Some(ModKind::Win) => mods.win = true,
                 None => {}
             }
         }
@@ -520,11 +532,12 @@ impl RecorderApp {
         let Some(target) = self.capturing_hotkey else {
             return;
         };
+        let win_held = self.current_mods().win;
         let pressed = ctx.input(|input| {
             input.events.iter().find_map(|event| match event {
                 egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => {
                     egui_key_name(*key).map(|name| {
-                        let mods = Mods { ctrl: modifiers.ctrl, shift: modifiers.shift, alt: modifiers.alt };
+                        let mods = Mods { ctrl: modifiers.ctrl, shift: modifiers.shift, alt: modifiers.alt, win: win_held };
                         Hotkey::new(mods, &name)
                     })
                 }
@@ -1014,7 +1027,7 @@ fn classify_key_event(key: rdev::Key, pressed: bool) -> Option<InputAction> {
     let name = format!("{key:?}");
     let supported = key_from_name(&name).is_some() || name == "Pause" || name == "ScrollLock";
     if !supported {
-        return pressed.then_some(InputAction::UnsupportedKey(name));
+        return Some(InputAction::UnsupportedKey(name, pressed));
     }
     Some(if pressed {
         InputAction::KeyDown(name)

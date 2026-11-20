@@ -10,7 +10,7 @@ Gravador de macros para Windows, feito em Rust (egui). Grava **apenas**:
 
 ## Recursos
 
-- **Atalhos configuráveis**: `F9` grava/para, `F11` reproduz e `F10` pausa/retoma e `F12` para. Aceitam combinações como `Ctrl+K` ou `Ctrl+Shift+F5`. Clique em *Alterar* e aperte as teclas. Ficam salvos em `%APPDATA%\MacroRecorder\config.json`.
+- **Atalhos configuráveis**: `F9` grava/para, `F11` reproduz e `F10` pausa/retoma e `F12` para. Aceitam combinações como `Ctrl+K`, `Ctrl+Shift+F5` ou `Ctrl+Win+Num 5` (tecla Windows, teclado numérico e teclas de mídia). A tecla Fn não é visível para o Windows. Clique em *Alterar* e aperte as teclas. Ficam salvos em `%APPDATA%\MacroRecorder\config.json`.
 - **Velocidade de reprodução**: 0.5x, 1x, 2x, 100x ou personalizada (1x a 100x).
 - **Repetições**: número editável de vezes ou repetição infinita.
 - Salvar e abrir macros em JSON, com o nome do arquivo editável no próprio app.

@@ -5,6 +5,7 @@ pub struct Mods {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
+    pub win: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,6 +13,7 @@ pub enum ModKind {
     Ctrl,
     Shift,
     Alt,
+    Win,
 }
 
 /// Returns which modifier an `rdev` key name stands for, if any.
@@ -20,6 +22,7 @@ pub fn modifier_kind(name: &str) -> Option<ModKind> {
         "ControlLeft" | "ControlRight" => Some(ModKind::Ctrl),
         "ShiftLeft" | "ShiftRight" => Some(ModKind::Shift),
         "Alt" | "AltGr" => Some(ModKind::Alt),
+        "MetaLeft" | "MetaRight" => Some(ModKind::Win),
         _ => None,
     }
 }
@@ -46,6 +49,7 @@ impl Hotkey {
                 "Ctrl" => mods.ctrl = true,
                 "Shift" => mods.shift = true,
                 "Alt" => mods.alt = true,
+                "Win" => mods.win = true,
                 _ => {}
             }
         }
@@ -62,6 +66,9 @@ impl Hotkey {
         }
         if self.mods.alt {
             text.push_str("Alt+");
+        }
+        if self.mods.win {
+            text.push_str("Win+");
         }
         text.push_str(&self.key);
         text
@@ -80,7 +87,32 @@ impl Hotkey {
     }
 }
 
+/// Keys that can be used in a shortcut even though they cannot be recorded in a macro:
+/// keypad keys, Num Lock, Print Screen and media keys (reported by rdev as `Unknown(vk)`).
+pub fn hotkey_key_allowed(name: &str) -> bool {
+    name.starts_with("Kp") || name == "NumLock" || name == "PrintScreen" || media_key_label(name).is_some()
+}
+
+fn media_key_label(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "Unknown(173)" => "Mudo",
+        "Unknown(174)" => "Volume -",
+        "Unknown(175)" => "Volume +",
+        "Unknown(176)" => "Próxima faixa",
+        "Unknown(177)" => "Faixa anterior",
+        "Unknown(178)" => "Parar mídia",
+        "Unknown(179)" => "Play/Pausa mídia",
+        _ => return None,
+    })
+}
+
 pub fn key_label(key: &str) -> String {
+    if let Some(label) = media_key_label(key) {
+        return label.to_owned();
+    }
+    if let Some(rest) = key.strip_prefix("Kp") {
+        return format!("Num {rest}");
+    }
     if let Some(letter) = key.strip_prefix("Key").filter(|rest| rest.len() == 1) {
         return letter.to_owned();
     }
@@ -112,6 +144,16 @@ mod tests {
         let combo = Hotkey::parse("Ctrl+KeyK");
         assert!(combo.matches("KeyK", Mods { ctrl: true, ..Mods::default() }));
         assert!(!combo.matches("KeyK", Mods::default()));
-        assert!(!combo.matches("KeyK", Mods { ctrl: true, shift: true, alt: false }));
+        assert!(!combo.matches("KeyK", Mods { ctrl: true, shift: true, ..Mods::default() }));
+    }
+
+    #[test]
+    fn supports_windows_key_keypad_and_media_keys() {
+        let combo = Hotkey::parse("Ctrl+Win+Kp5");
+        assert!(combo.mods.ctrl && combo.mods.win);
+        assert_eq!(combo.label(), "Ctrl+Win+Num 5");
+        assert!(hotkey_key_allowed("Kp5"));
+        assert!(hotkey_key_allowed("Unknown(175)"));
+        assert!(!hotkey_key_allowed("Unknown(999)"));
     }
 }
