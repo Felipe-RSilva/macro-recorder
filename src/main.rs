@@ -950,22 +950,31 @@ fn classify_key_event(key: rdev::Key, pressed: bool) -> Option<InputAction> {
 static UI_CONTEXT: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
 
 fn listen_for_input(tx: Sender<InputMessage>) {
+    // The keyboard hook callback must return instantly or Windows silently removes the hook,
+    // so it only pushes into a channel. A second thread forwards and wakes the UI.
+    let (raw_tx, raw_rx) = mpsc::channel::<InputMessage>();
     thread::spawn(move || {
-        let event_tx = tx.clone();
+        for message in raw_rx {
+            let wake_ui = !matches!(&message, InputMessage::Event(InputAction::Move(_, _)));
+            if tx.send(message).is_err() {
+                break;
+            }
+            if wake_ui {
+                if let Some(ctx) = UI_CONTEXT.get() {
+                    ctx.request_repaint();
+                }
+            }
+        }
+    });
+    thread::spawn(move || {
+        let event_tx = raw_tx.clone();
         let result = rdev::listen(move |event| {
             if let Some(action) = classify_input_event(event.event_type) {
-                let wake_ui = !matches!(action, InputAction::Move(_, _));
                 let _ = event_tx.send(InputMessage::Event(action));
-                // Wake the UI so shortcuts work even while the window is in the background.
-                if wake_ui {
-                    if let Some(ctx) = UI_CONTEXT.get() {
-                        ctx.request_repaint();
-                    }
-                }
             }
         });
         if let Err(problem) = result {
-            let _ = tx.send(InputMessage::Error(format!("{problem:?}")));
+            let _ = raw_tx.send(InputMessage::Error(format!("{problem:?}")));
         }
     });
 }
